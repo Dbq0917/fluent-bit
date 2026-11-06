@@ -1,6 +1,17 @@
 #include <fluent-bit/flb_file.h>
+#include <fluent-bit/flb_compat.h>
 #include <fluent-bit/flb_sds.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <fluent-bit/flb_utils.h>
+#ifdef FLB_SYSTEM_WINDOWS
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "flb_tests_internal.h"
 #include "fluent-bit/stream_processor/flb_sp.h"
@@ -46,7 +57,172 @@ static void test_file_read_missing()
     TEST_CHECK(result == NULL);
 }
 
+#ifdef FLB_SYSTEM_WINDOWS
+static void test_file_windows_mkdir(void)
+{
+    char directory[MAX_PATH];
+    char path[MAX_PATH];
+    DWORD length;
+
+    length = GetTempPathA(sizeof(directory), directory);
+    TEST_ASSERT(length > 0 && length < sizeof(directory));
+    TEST_ASSERT(GetTempFileNameA(directory, "flb", 0, path) != 0);
+    TEST_CHECK(flb_file_mkdir_safe(path, 0755) == -1);
+    TEST_ASSERT(DeleteFileA(path) != 0);
+    TEST_CHECK(flb_file_mkdir_safe(path, 0755) == 0);
+    TEST_CHECK(flb_file_mkdir_safe(path, 0755) == 0);
+    TEST_CHECK(RemoveDirectoryA(path) != 0);
+}
+
+static void test_file_windows_root_join(void)
+{
+    char directory[MAX_PATH];
+    char filename[MAX_PATH];
+    char extended_root[MAX_PATH + 8];
+    char oversized_root[MAX_PATH + 1];
+    char oversized_path[MAX_PATH + 1];
+    char *name;
+    DWORD length;
+    int fd;
+
+    length = GetTempPathA(sizeof(directory), directory);
+    TEST_ASSERT(length > 0 && length < sizeof(directory));
+    TEST_ASSERT(GetTempFileNameA(directory, "flb", 0, filename) != 0);
+    name = strrchr(filename, '\\');
+    TEST_ASSERT(name != NULL);
+    name++;
+
+    /* GetTempPathA supplies a trailing backslash. */
+    fd = flb_file_open_safe(directory, name, O_RDONLY, 0, 0);
+    TEST_CHECK(fd >= 0);
+    if (fd >= 0) {
+        close(fd);
+    }
+    directory[length - 1] = '\0';
+    fd = flb_file_open_safe(directory, name, O_RDONLY, 0, 0);
+    TEST_CHECK(fd >= 0);
+    if (fd >= 0) {
+        close(fd);
+    }
+
+    if (strncmp(directory, "\\\\", 2) == 0) {
+        snprintf(extended_root, sizeof(extended_root), "\\\\?\\UNC\\%s", directory + 2);
+    }
+    else {
+        snprintf(extended_root, sizeof(extended_root), "\\\\?\\%s", directory);
+    }
+    fd = flb_file_open_safe(extended_root, name, O_RDONLY, 0, 0);
+    TEST_CHECK(fd >= 0);
+    if (fd >= 0) {
+        close(fd);
+    }
+    TEST_CHECK(DeleteFileA(filename) != 0);
+
+    memset(oversized_root, 'a', sizeof(oversized_root) - 1);
+    oversized_root[sizeof(oversized_root) - 1] = '\0';
+    TEST_CHECK(flb_file_open_safe(oversized_root, "file", O_RDONLY, 0, 0) == -1);
+    TEST_CHECK(errno == ENAMETOOLONG);
+
+    memset(oversized_path, 'b', sizeof(oversized_path) - 1);
+    oversized_path[sizeof(oversized_path) - 1] = '\0';
+    TEST_CHECK(flb_file_open_safe(directory, oversized_path, O_RDONLY, 0, 0) == -1);
+    TEST_CHECK(errno == ENAMETOOLONG);
+
+    /* Each component fits alone, but the joined path needs space for its NUL. */
+    oversized_root[MAX_PATH - 3] = '\0';
+    TEST_CHECK(flb_file_open_safe(oversized_root, "ab", O_RDONLY, 0, 0) == -1);
+    TEST_CHECK(errno == ENAMETOOLONG);
+    oversized_root[MAX_PATH - 4] = FLB_DIRCHAR;
+    TEST_CHECK(flb_file_open_safe(oversized_root, "abc", O_RDONLY, 0, 0) == -1);
+    TEST_CHECK(errno == ENAMETOOLONG);
+    TEST_CHECK(flb_file_open_safe("", "file", O_RDONLY, 0, 0) == -1);
+    TEST_CHECK(errno == EINVAL);
+    TEST_CHECK(flb_file_open_safe(directory, NULL, O_RDONLY, 0, 0) == -1);
+    TEST_CHECK(errno == EINVAL);
+}
+#else
+static void test_file_containment(void)
+{
+    char template[] = "/tmp/flb-file-safe-XXXXXX";
+    char directory[PATH_MAX];
+    char path[PATH_MAX + 32];
+    char other[PATH_MAX + 32];
+    char content[8] = {0};
+    char *buffer;
+    size_t size;
+    int fd;
+    FILE *stream;
+
+    TEST_ASSERT(mkdtemp(template) != NULL);
+    TEST_ASSERT(realpath(template, directory) != NULL);
+    stream = flb_file_fopen_safe(directory, "regular", "w+", 0);
+    TEST_ASSERT(stream != NULL);
+    TEST_CHECK(fwrite("secret", 1, 6, stream) == 6);
+    fclose(stream);
+
+    snprintf(path, sizeof(path), "%s/link", directory);
+    TEST_CHECK(symlink("regular", path) == 0);
+    TEST_CHECK(flb_file_fopen_safe(directory, "link", "w", 0) == NULL);
+    TEST_CHECK(flb_utils_read_file_offset_safe(path, 0, 0, &buffer, &size) == -1);
+    TEST_ASSERT(flb_utils_read_file_offset(path, 0, 0, &buffer, &size) == 0);
+    TEST_CHECK(size == 6);
+    TEST_CHECK(memcmp(buffer, "secret", 6) == 0);
+    flb_free(buffer);
+    TEST_CHECK(unlink(path) == 0);
+    TEST_CHECK(symlink("missing", path) == 0);
+    TEST_CHECK(flb_file_fopen_safe(directory, "link", "w", 0) == NULL);
+    TEST_CHECK(unlink(path) == 0);
+
+    snprintf(other, sizeof(other), "%s-other", directory);
+    TEST_ASSERT(mkdir(other, 0700) == 0);
+    TEST_CHECK(symlink(other, path) == 0);
+    TEST_CHECK(flb_file_fopen_safe(directory, "link/new/file", "w", 0700) == NULL);
+    TEST_CHECK(flb_file_fopen_safe(directory, "../escape", "w", 0700) == NULL);
+    TEST_CHECK(flb_file_fopen_safe(directory, other, "w", 0700) == NULL);
+    TEST_CHECK(flb_file_mkdir_safe(path, 0700) == -1);
+    TEST_CHECK(flb_file_open_safe(directory, "link", O_RDONLY | O_DIRECTORY, 0, 0) == -1);
+    snprintf(path, sizeof(path), "%s/link/victim", directory);
+    TEST_CHECK(flb_file_unlink_safe(path) == -1);
+    snprintf(other, sizeof(other), "%s/regular", directory);
+    TEST_CHECK(flb_file_rename_safe(other, path) == -1);
+    snprintf(path, sizeof(path), "%s/link", directory);
+    snprintf(other, sizeof(other), "%s-other", directory);
+    TEST_CHECK(unlink(path) == 0);
+    TEST_CHECK(rmdir(other) == 0);
+
+    stream = flb_file_fopen_safe(directory, "nested/file", "a+", 0700);
+    TEST_ASSERT(stream != NULL);
+    fclose(stream);
+    snprintf(path, sizeof(path), "%s/nested/file", directory);
+    snprintf(other, sizeof(other), "%s/renamed", directory);
+    TEST_CHECK(flb_file_rename_safe(path, other) == 0);
+    TEST_CHECK(flb_file_unlink_safe(other) == 0);
+    snprintf(path, sizeof(path), "%s/nested", directory);
+    TEST_CHECK(rmdir(path) == 0);
+
+    snprintf(path, sizeof(path), "%s/fifo", directory);
+    TEST_ASSERT(mkfifo(path, 0600) == 0);
+    TEST_CHECK(flb_file_open_safe(NULL, path, O_RDONLY, 0, 0) == -1);
+    TEST_CHECK(unlink(path) == 0);
+
+    fd = flb_file_open_safe(directory, "regular", O_RDONLY, 0, 0);
+    TEST_ASSERT(fd >= 0);
+    TEST_CHECK(read(fd, content, sizeof(content)) == 6);
+    TEST_CHECK(strcmp(content, "secret") == 0);
+    close(fd);
+    snprintf(path, sizeof(path), "%s/regular", directory);
+    TEST_CHECK(unlink(path) == 0);
+    TEST_CHECK(rmdir(directory) == 0);
+}
+#endif
+
 TEST_LIST = {
+#ifdef FLB_SYSTEM_WINDOWS
+    { "file_windows_mkdir", test_file_windows_mkdir },
+    { "file_windows_root_join", test_file_windows_root_join },
+#else
+    { "file_containment", test_file_containment },
+#endif
     { "file_read_text_file" , test_file_read_text_file},
     { "file_read_empty_file" , test_file_read_empty_file},
     { "file_read_missing" , test_file_read_missing},
