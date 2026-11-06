@@ -17,6 +17,7 @@
  *  limitations under the License.
  */
 
+#include <fluent-bit/flb_file.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -49,6 +50,8 @@
 /* Glob support */
 #ifndef _MSC_VER
 #include <glob.h>
+#include <dirent.h>
+#include <fcntl.h>
 #endif
 
 #ifdef _WIN32
@@ -317,11 +320,43 @@ static flb_sds_t fleet_config_deref(struct flb_in_calyptia_fleet_config *ctx,
     return config_path;
 }
 
+static FILE *fleet_file_open(struct flb_in_calyptia_fleet_config *ctx,
+                             const char *path, const char *mode)
+{
+    if (ctx->follow_symlinks) {
+        return fopen(path, mode);
+    }
+    return flb_file_fopen_safe(NULL, path, mode, 0);
+}
+
+static int fleet_file_unlink(struct flb_in_calyptia_fleet_config *ctx, const char *path)
+{
+    if (ctx->follow_symlinks) {
+        return unlink(path);
+    }
+    return flb_file_unlink_safe(path);
+}
+
+static int fleet_directory_create(struct flb_in_calyptia_fleet_config *ctx,
+                                   const char *path)
+{
+    struct stat st;
+
+    if (!ctx->follow_symlinks) {
+        return flb_file_mkdir_safe(path, 0700);
+    }
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        return 0;
+    }
+    return flb_utils_mkdir(path, 0700);
+}
+
 /**
  * Atomically renames old_path to new_path.
  * Returns FLB_TRUE if successful, FLB_FALSE otherwise.
  */
-static int rename_file(const char *old_path, const char *new_path)
+static int rename_file(struct flb_in_calyptia_fleet_config *ctx,
+                        const char *old_path, const char *new_path)
 {
 #ifdef _WIN32
     if (MoveFileExA(old_path, new_path,
@@ -330,7 +365,8 @@ static int rename_file(const char *old_path, const char *new_path)
     }
     return FLB_FALSE;
 #else
-    if (rename(old_path, new_path) == 0) {
+    if ((ctx->follow_symlinks ? rename(old_path, new_path) :
+         flb_file_rename_safe(old_path, new_path)) == 0) {
         return FLB_TRUE;
     }
     return FLB_FALSE;
@@ -349,7 +385,12 @@ static int copy_file_atomic(struct flb_in_calyptia_fleet_config *ctx,
     int ret;
     int close_ret;
 
-    ret = flb_utils_read_file((char *) source_path, &buf, &size);
+    if (ctx->follow_symlinks) {
+        ret = flb_utils_read_file((char *) source_path, &buf, &size);
+    }
+    else {
+        ret = flb_utils_read_file_offset_safe((char *) source_path, 0, 0, &buf, &size);
+    }
     if (ret != 0) {
         flb_plg_warn(ctx->ins, "unable to read file for migration: %s", source_path);
         return FLB_FALSE;
@@ -367,7 +408,7 @@ static int copy_file_atomic(struct flb_in_calyptia_fleet_config *ctx,
         return FLB_FALSE;
     }
 
-    target_file = fopen(temp_path, "wb");
+    target_file = fleet_file_open(ctx, temp_path, "wb");
     if (target_file == NULL) {
         flb_errno();
         flb_plg_warn(ctx->ins, "unable to open migration temp file: %s", temp_path);
@@ -382,7 +423,7 @@ static int copy_file_atomic(struct flb_in_calyptia_fleet_config *ctx,
     if (written != size) {
         flb_plg_warn(ctx->ins, "truncated write during migration: %s", temp_path);
         fclose(target_file);
-        unlink(temp_path);
+        fleet_file_unlink(ctx, temp_path);
         flb_sds_destroy(temp_path);
         return FLB_FALSE;
     }
@@ -391,14 +432,14 @@ static int copy_file_atomic(struct flb_in_calyptia_fleet_config *ctx,
     if (close_ret != 0) {
         flb_errno();
         flb_plg_warn(ctx->ins, "unable to close migration temp file: %s", temp_path);
-        unlink(temp_path);
+        fleet_file_unlink(ctx, temp_path);
         flb_sds_destroy(temp_path);
         return FLB_FALSE;
     }
 
-    if (rename_file(temp_path, target_path) != FLB_TRUE) {
+    if (rename_file(ctx, temp_path, target_path) != FLB_TRUE) {
         flb_plg_warn(ctx->ins, "unable to move migrated config into place: %s", target_path);
-        unlink(temp_path);
+        fleet_file_unlink(ctx, temp_path);
         flb_sds_destroy(temp_path);
         return FLB_FALSE;
     }
@@ -450,7 +491,7 @@ static int fleet_config_set_ref(struct flb_in_calyptia_fleet_config *ctx,
         return FLB_FALSE;
     }
 
-    temp_file_ptr = fopen(temp_filename, "w");
+    temp_file_ptr = fleet_file_open(ctx, temp_filename, "w");
     if (temp_file_ptr == NULL) {
         flb_plg_error(ctx->ins, "fleet_config_set_ref: unable to open temp file for writing: %s", temp_filename);
         flb_sds_destroy(ref_filename);
@@ -463,7 +504,7 @@ static int fleet_config_set_ref(struct flb_in_calyptia_fleet_config *ctx,
     if (written != to_write) {
         flb_plg_error(ctx->ins, "fleet_config_set_ref: unable to write to temp file: %s", temp_filename);
         fclose(temp_file_ptr);
-        unlink(temp_filename);
+        fleet_file_unlink(ctx, temp_filename);
         flb_sds_destroy(ref_filename);
         flb_sds_destroy(temp_filename);
         return FLB_FALSE;
@@ -473,10 +514,10 @@ static int fleet_config_set_ref(struct flb_in_calyptia_fleet_config *ctx,
     fclose(temp_file_ptr);
 
     /* Rename the temporary file to the ref file */
-    if (rename_file(temp_filename, ref_filename) != FLB_TRUE) {
+    if (rename_file(ctx, temp_filename, ref_filename) != FLB_TRUE) {
         flb_plg_error(ctx->ins, "fleet_config_set_ref: unable to rename temp file to ref file: %s -> %s",
                       temp_filename, ref_filename);
-        unlink(temp_filename);
+        fleet_file_unlink(ctx, temp_filename);
         flb_sds_destroy(ref_filename);
         flb_sds_destroy(temp_filename);
         return FLB_FALSE;
@@ -819,7 +860,8 @@ static int migrate_flat_yaml_fleet_config_ref(struct flb_in_calyptia_fleet_confi
 
         if (copy_file_atomic(ctx, *config_path, migrated_path) == FLB_FALSE) {
             flb_sds_destroy(migrated_path);
-            return FLB_TRUE;
+            /* Hardened reads must not fall back to reloading the rejected source. */
+            return ctx->follow_symlinks ? FLB_TRUE : FLB_FALSE;
         }
         copied = FLB_TRUE;
     }
@@ -1551,7 +1593,7 @@ static int get_calyptia_file(struct flb_in_calyptia_fleet_config *ctx,
     }
 
 
-    fp = fopen(fname, "w+");
+    fp = fleet_file_open(ctx, fname, "w+");
 
     if (fp == NULL) {
         goto file_error;
@@ -1760,11 +1802,91 @@ static struct cfl_array *read_glob(const char *path)
 
 #endif
 
+#ifndef FLB_SYSTEM_WINDOWS
+static int delete_dir_at(int parent_fd, const char *name)
+{
+    DIR *directory;
+    struct dirent *entry;
+    int fd;
+    int ret = FLB_TRUE;
+
+    fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOTDIR || errno == ELOOP) {
+            return unlinkat(parent_fd, name, 0) == 0 ? FLB_TRUE : FLB_FALSE;
+        }
+        return FLB_FALSE;
+    }
+    directory = fdopendir(fd);
+    if (directory == NULL) {
+        close(fd);
+        return FLB_FALSE;
+    }
+    while (1) {
+        errno = 0;
+        entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0) {
+                ret = FLB_FALSE;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (delete_dir_at(fd, entry->d_name) == FLB_FALSE) {
+            ret = FLB_FALSE;
+        }
+    }
+    closedir(directory);
+    if (ret == FLB_TRUE && unlinkat(parent_fd, name, AT_REMOVEDIR) != 0) {
+        ret = FLB_FALSE;
+    }
+    return ret;
+}
+
+static int delete_dir_safe(const char *path)
+{
+    char *copy;
+    char *name;
+    const char *parent;
+    int parent_fd;
+    int ret;
+
+    copy = flb_strdup(path);
+    if (copy == NULL) {
+        return FLB_FALSE;
+    }
+    name = strrchr(copy, '/');
+    if (name == NULL) {
+        parent = ".";
+        name = copy;
+    }
+    else {
+        *name++ = '\0';
+        parent = copy[0] == '\0' ? "/." : copy;
+    }
+    if (*name == '\0' || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        flb_free(copy);
+        return FLB_FALSE;
+    }
+    parent_fd = flb_file_open_safe(NULL, parent, O_RDONLY | O_DIRECTORY, 0, 0);
+    if (parent_fd < 0) {
+        flb_free(copy);
+        return FLB_FALSE;
+    }
+    ret = delete_dir_at(parent_fd, name);
+    close(parent_fd);
+    flb_free(copy);
+    return ret;
+}
+#endif
+
 /**
  * Deletes the directory at path and all the files in it.
  * FLB_TRUE is returned if successful, otherwise FLB_FALSE.
  */
-static int delete_dir(const char *path)
+static int delete_dir(struct flb_in_calyptia_fleet_config *ctx, const char *path)
 {
     flb_sds_t glob_pattern;
     struct cfl_array *files;
@@ -1775,6 +1897,11 @@ static int delete_dir(const char *path)
     if (path == NULL) {
         return FLB_FALSE;
     }
+#ifndef FLB_SYSTEM_WINDOWS
+    if (!ctx->follow_symlinks) {
+        return delete_dir_safe(path);
+    }
+#endif
     glob_pattern = flb_sds_create(path);
     if (glob_pattern == NULL) {
         return FLB_FALSE;
@@ -1789,7 +1916,7 @@ static int delete_dir(const char *path)
         for (idx = 0; idx < files->entry_count; idx++) {
             if (stat(files->entries[idx]->data.as_string, &st) == 0) {
                 if (S_ISDIR(st.st_mode)) {
-                    if (delete_dir(files->entries[idx]->data.as_string) != FLB_TRUE) {
+                    if (delete_dir(ctx, files->entries[idx]->data.as_string) != FLB_TRUE) {
                         ret = FLB_FALSE;
                     }
                 }
@@ -1842,7 +1969,7 @@ static int calyptia_config_delete_by_ref(struct flb_in_calyptia_fleet_config *ct
         *fname = '\0';
         flb_plg_info(ctx->ins, "deleting config directory: %s", config_path);
 
-        if (delete_dir(config_path) == FLB_FALSE) {
+        if (delete_dir(ctx, config_path) == FLB_FALSE) {
             flb_plg_warn(ctx->ins, "unable to delete config directory: %s", config_path);
         }
 
@@ -1874,10 +2001,18 @@ static int calyptia_config_delete_by_ref(struct flb_in_calyptia_fleet_config *ct
     }
     for (idx = 0; idx < confs->entry_count; idx++) {
         entry_path = confs->entries[idx]->data.as_string;
+#ifndef FLB_SYSTEM_WINDOWS
+        if (!ctx->follow_symlinks) {
+            if (delete_dir_safe(entry_path) == FLB_FALSE) {
+                flb_plg_warn(ctx->ins, "unable to delete config entry: %s", entry_path);
+            }
+            continue;
+        }
+#endif
         if (stat(entry_path, &entry_stat) == 0) {
             if (S_ISDIR(entry_stat.st_mode)) {
                 flb_plg_info(ctx->ins, "deleting config directory: %s", entry_path);
-                if (delete_dir(entry_path) == FLB_FALSE) {
+                if (delete_dir(ctx, entry_path) == FLB_FALSE) {
                     flb_plg_warn(ctx->ins, "unable to delete config directory: %s", entry_path);
                 }
             }
@@ -1897,7 +2032,7 @@ delete_ref:
     ref_filename = fleet_config_ref_filename(ctx, ref_name);
     if (ref_filename != NULL) {
         flb_plg_info(ctx->ins, "deleting config ref file: %s", ref_filename);
-        if (unlink(ref_filename) != 0) {
+        if (fleet_file_unlink(ctx, ref_filename) != 0) {
             flb_plg_warn(ctx->ins, "unable to delete config ref file: %s", ref_filename);
         }
         flb_sds_destroy(ref_filename);
@@ -2230,6 +2365,7 @@ flb_sds_t fleet_config_get(struct flb_in_calyptia_fleet_config *ctx)
 
                 if (fleet_id == NULL) {
                     flb_plg_error(ctx->ins, "unable to get fleet_id from header");
+                    flb_sds_destroy(buf);
                     return NULL;
                 }
 
@@ -2266,7 +2402,7 @@ static int create_fleet_header(struct flb_in_calyptia_fleet_config *ctx)
         goto header_error;
     }
 
-    fp = fopen(hdrname, "w+");
+    fp = fleet_file_open(ctx, hdrname, "w+");
     if (fp == NULL) {
         goto file_open_error;
     }
@@ -2278,7 +2414,9 @@ static int create_fleet_header(struct flb_in_calyptia_fleet_config *ctx)
     rc = FLB_TRUE;
 
 file_error:
-    fclose(fp);
+    if (fclose(fp) != 0) {
+        rc = FLB_FALSE;
+    }
 file_open_error:
     flb_sds_destroy(header);
 header_error:
@@ -2320,7 +2458,10 @@ int get_calyptia_fleet_config(struct flb_in_calyptia_fleet_config *ctx)
         flb_sds_printf(&ctx->fleet_files_url, CALYPTIA_ENDPOINT_FLEET_FILES, ctx->fleet_id);
     }
 
-    create_fleet_header(ctx);
+    if (create_fleet_header(ctx) == FLB_FALSE) {
+        flb_plg_error(ctx->ins, "unable to create fleet header safely");
+        return FLB_FALSE;
+    }
 
     hdrname = fleet_config_filename(ctx, "header");
     header = flb_sds_create_size(CALYPTIA_MAX_DIR_SIZE);
@@ -2357,7 +2498,24 @@ int get_calyptia_fleet_config(struct flb_in_calyptia_fleet_config *ctx)
         else {
             flb_plg_info(ctx->ins, "fleet API returned new config (none -> %lld)", (long long)time_last_modified);
         }
-        get_calyptia_files(ctx, time_last_modified);
+        if (get_calyptia_files(ctx, time_last_modified) < 0) {
+            flb_plg_error(ctx->ins, "unable to write fleet files safely");
+            /* Do not let a partial revision suppress the next download attempt. */
+            if (ctx->fleet_config_legacy_format) {
+                cfgname = time_fleet_config_filename(ctx, time_last_modified);
+                if (cfgname != NULL && fleet_file_unlink(ctx, cfgname) != 0) {
+                    flb_plg_warn(ctx->ins, "unable to remove incomplete config: %s", cfgname);
+                }
+            }
+            else {
+                cfgname = fleet_gendir(ctx, time_last_modified);
+                if (cfgname != NULL && delete_dir(ctx, cfgname) == FLB_FALSE) {
+                    flb_plg_warn(ctx->ins, "unable to remove incomplete config directory: %s", cfgname);
+                }
+            }
+            flb_sds_destroy(cfgname);
+            return FLB_FALSE;
+        }
 
         cfgname = time_fleet_config_filename(ctx, time_last_modified);
 
@@ -2456,7 +2614,7 @@ static int create_fleet_directory(struct flb_in_calyptia_fleet_config *ctx)
     flb_sds_t myfleetdir;
 
     if (access(ctx->config_dir, F_OK) != 0) {
-        if (flb_utils_mkdir(ctx->config_dir, 0700) != 0) {
+        if (fleet_directory_create(ctx, ctx->config_dir) != 0) {
             return -1;
         }
     }
@@ -2467,7 +2625,7 @@ static int create_fleet_directory(struct flb_in_calyptia_fleet_config *ctx)
     }
 
     if (access(myfleetdir, F_OK) != 0) {
-        if (flb_utils_mkdir(myfleetdir, 0700) !=0) {
+        if (fleet_directory_create(ctx, myfleetdir) !=0) {
             return -1;
         }
     }
@@ -2508,15 +2666,11 @@ static int fleet_mkdir(struct flb_in_calyptia_fleet_config *ctx, time_t timestam
 {
     int ret = -1;
     flb_sds_t fleetcurdir;
-    struct stat st;
 
     fleetcurdir = fleet_gendir(ctx, timestamp);
 
     if (fleetcurdir != NULL) {
-        if (stat(fleetcurdir, &st) == 0 && S_ISDIR(st.st_mode)) {
-            ret = 0;
-        }
-        else if (flb_utils_mkdir(fleetcurdir, 0700) == 0) {
+        if (fleet_directory_create(ctx, fleetcurdir) == 0) {
             ret = 0;
         }
         flb_sds_destroy(fleetcurdir);
@@ -2582,7 +2736,8 @@ static int load_fleet_config(struct flb_in_calyptia_fleet_config *ctx)
     return FLB_FALSE;
 }
 
-static int create_fleet_file(flb_sds_t fleetdir,
+static int create_fleet_file(struct flb_in_calyptia_fleet_config *ctx,
+                             flb_sds_t fleetdir,
                              const char *name,
                              int nlen,
                              const char *b64_content,
@@ -2594,6 +2749,15 @@ static int create_fleet_file(flb_sds_t fleetdir,
     FILE *fp;
     int ret;
 
+    /* Fleet attachments are names, not paths. Reject embedded NULs as well. */
+    if (fleetdir == NULL || nlen <= 0 || memchr(name, '\0', nlen) != NULL ||
+        memchr(name, '/', nlen) != NULL || memchr(name, '\\', nlen) != NULL ||
+        memchr(name, ':', nlen) != NULL ||
+        (nlen == 1 && name[0] == '.') ||
+        (nlen == 2 && name[0] == '.' && name[1] == '.')) {
+        return -1;
+    }
+
     fname = flb_sds_create_size(strlen(fleetdir) + nlen + 2);
     if (fname == NULL) {
         return -1;
@@ -2604,7 +2768,7 @@ static int create_fleet_file(flb_sds_t fleetdir,
         return -1;
     }
 
-    if (flb_sds_cat_safe(&fname, "/", 1) < 0) {
+    if (flb_sds_cat_safe(&fname, PATH_SEPARATOR, 1) < 0) {
         flb_sds_destroy(fname);
         return -1;
     }
@@ -2614,7 +2778,12 @@ static int create_fleet_file(flb_sds_t fleetdir,
         return -1;
     }
 
-    fp = fopen(fname, "w+");
+    if (ctx->follow_symlinks) {
+        fp = fopen(fname, "w+");
+    }
+    else {
+        fp = flb_file_fopen_safe(fleetdir, fname + strlen(fleetdir) + 1, "w+", 0);
+    }
     if (fp == NULL) {
         flb_sds_destroy(fname);
         return -1;
@@ -2678,51 +2847,57 @@ static int create_fleet_files(struct flb_in_calyptia_fleet_config *ctx,
     fleetdir = fleet_gendir(ctx, timestamp);
 
     msgpack_unpacked_init(&result);
+    ret = -1;
+    if (fleetdir == NULL) {
+        goto cleanup;
+    }
     while (msgpack_unpack_next(&result, pack, out_size, &off) == MSGPACK_UNPACK_SUCCESS) {
         if (result.data.type != MSGPACK_OBJECT_ARRAY) {
             continue;
         }
         for (idx = 0; idx < result.data.via.array.size; idx++) {
+            ret = -1;
             map = msgpack_lookup_array_offset(&result.data, idx);
 
             if (map == NULL) {
-                flb_sds_destroy(fleetdir);
-                return -1;
+                goto cleanup;
             }
 
             name = msgpack_lookup_map_key(map, "name");
             if (name == NULL) {
-                flb_sds_destroy(fleetdir);
-                return -1;
+                goto cleanup;
             }
             if (name->type != MSGPACK_OBJECT_STR) {
-                flb_sds_destroy(fleetdir);
-                return -1;
+                goto cleanup;
             }
 
             contents = msgpack_lookup_map_key(map, "contents");
             if (contents == NULL) {
-                flb_sds_destroy(fleetdir);
-                return -1;
+                goto cleanup;
             }
             if (contents->type != MSGPACK_OBJECT_STR) {
-                flb_sds_destroy(fleetdir);
-                return -1;
+                goto cleanup;
             }
 
-            create_fleet_file(fleetdir,
+            ret = create_fleet_file(ctx, fleetdir,
                               name->via.str.ptr,
                               name->via.str.size,
                               contents->via.str.ptr,
                               contents->via.str.size);
+            if (ret != 0) {
+                goto cleanup;
+            }
         }
     }
 
+    ret = 0;
+
+cleanup:
     msgpack_unpacked_destroy(&result);
     flb_sds_destroy(fleetdir);
     flb_free(pack);
 
-    return 0;
+    return ret;
 }
 
 static int get_calyptia_files(struct flb_in_calyptia_fleet_config *ctx,
@@ -2740,7 +2915,9 @@ static int get_calyptia_files(struct flb_in_calyptia_fleet_config *ctx,
         return -1;
     }
 
-    fleet_mkdir(ctx, timestamp);
+    if (fleet_mkdir(ctx, timestamp) != 0) {
+        goto file_error;
+    }
     ret = create_fleet_files(ctx, client->resp.payload, client->resp.payload_size, timestamp);
     if (ret != 0) {
         goto file_error;
@@ -2804,7 +2981,7 @@ static int cleanup_legacy_config_state(struct flb_in_calyptia_fleet_config *ctx)
         return FLB_FALSE;
     }
 
-    if (delete_dir(base_dir) != FLB_TRUE) {
+    if (delete_dir(ctx, base_dir) != FLB_TRUE) {
         flb_plg_error(ctx->ins, "unable to delete legacy config state in directory %s", base_dir);
         flb_sds_destroy(base_dir);
         return FLB_FALSE;
@@ -3039,6 +3216,12 @@ static int in_calyptia_fleet_exit(void *data, struct flb_config *config)
 }
 
 static struct flb_config_map config_map[] = {
+    {
+     FLB_CONFIG_MAP_BOOL, "follow_symlinks", "true",
+     0, FLB_TRUE, offsetof(struct flb_in_calyptia_fleet_config, follow_symlinks),
+     "Follow symbolic links when accessing files. Set false to enable strict "
+     "POSIX path containment; Windows reparse-point containment is unsupported."
+    },
     {
      FLB_CONFIG_MAP_STR, "api_key", NULL,
      0, FLB_TRUE, offsetof(struct flb_in_calyptia_fleet_config, api_key),
