@@ -4,6 +4,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +49,11 @@ class PersistentWriter:
 
     def write_line(self, text):
         os.write(self.fd, f"{text}\n".encode("utf-8"))
+        os.fsync(self.fd)
+
+    def write_lines(self, lines):
+        data = "".join(f"{line}\n" for line in lines).encode("utf-8")
+        os.write(self.fd, data)
         os.fsync(self.fd)
 
     def close(self):
@@ -504,6 +510,160 @@ def test_in_tail_follows_rename_rotation(workspace):
     finally:
         writer_old.close()
         service.stop()
+
+
+@skip_on_windows
+def test_in_tail_switches_by_identity_when_archive_keeps_same_basename(workspace):
+    active_log = workspace / "logs" / "app.log"
+    archive_log = workspace / "archive" / "app.log"
+    db_path = workspace / "tail.db"
+
+    active_log.parent.mkdir()
+    archive_log.parent.mkdir()
+
+    writer_old = PersistentWriter(active_log)
+    writer_old.write_line("before-archive")
+
+    service = Service("tail_inotify.yaml", tail_path=active_log, db_path=db_path)
+
+    try:
+        service.start()
+        service.wait_for_records(1)
+
+        os.rename(active_log, archive_log)
+
+        writer_new = PersistentWriter(active_log, append=True)
+        try:
+            writer_old.write_line("old-handle-after-archive")
+            writer_new.write_line("new-handle-after-recreate")
+            records = service.wait_for_records(3, timeout=20)
+        finally:
+            writer_new.close()
+
+        assert_log_set(
+            records,
+            [
+                "before-archive",
+                "old-handle-after-archive",
+                "new-handle-after-recreate",
+            ],
+        )
+
+        log_text = Path(service.flb.log_file).read_text(
+            encoding="utf-8", errors="replace"
+        )
+        assert "file switch:" in log_text
+        assert f"old_inode={os.stat(archive_log).st_ino}" in log_text
+        assert f"new_inode={os.stat(active_log).st_ino}" in log_text
+    finally:
+        writer_old.close()
+        service.stop()
+
+
+@skip_on_windows
+def test_in_tail_identity_switch_under_write_load_has_no_loss_or_duplicates(workspace):
+    active_log = workspace / "load.log"
+    archived_log = workspace / "load.log.1"
+    db_path = workspace / "tail.db"
+    old_line_count = 400
+    new_line_count = 400
+    old_prefix = "old-under-load"
+    new_prefix = "new-after-switch"
+
+    writer_old = PersistentWriter(active_log)
+    writer_old.write_line("before-load")
+
+    service = Service("tail_inotify.yaml", tail_path=active_log, db_path=db_path)
+
+    try:
+        service.start()
+        service.wait_for_records(1)
+
+        started = threading.Event()
+
+        def write_old_side():
+            for index in range(old_line_count):
+                writer_old.write_line(f"{old_prefix}-{index}")
+                started.set()
+                time.sleep(0.001)
+
+        writer_thread = threading.Thread(target=write_old_side, daemon=True)
+        writer_thread.start()
+        assert started.wait(timeout=5)
+
+        os.rename(active_log, archived_log)
+        writer_new = PersistentWriter(active_log, append=True)
+        try:
+            writer_new.write_lines(
+                [f"{new_prefix}-{index}" for index in range(new_line_count)]
+            )
+            writer_thread.join(timeout=20)
+            assert not writer_thread.is_alive()
+        finally:
+            writer_new.close()
+
+        expected = ["before-load"]
+        expected.extend(
+            f"{old_prefix}-{index}" for index in range(old_line_count)
+        )
+        expected.extend(
+            f"{new_prefix}-{index}" for index in range(new_line_count)
+        )
+
+        records = service.wait_for_records(
+            len(expected), timeout=max(30, len(expected) // 100)
+        )
+        assert_log_set(records, expected)
+    finally:
+        writer_old.close()
+        service.stop()
+
+
+@skip_on_windows
+def test_in_tail_restart_resumes_after_same_name_recreate(workspace):
+    active_log = workspace / "resume-recreate.log"
+    archived_log = workspace / "archive" / "resume-recreate.log"
+    db_path = workspace / "tail.db"
+
+    archived_log.parent.mkdir()
+    write_and_sync(active_log, "before-recreate\n")
+
+    first_run = Service("tail_inotify.yaml", tail_path=active_log, db_path=db_path)
+    try:
+        first_run.start()
+        first_run.wait_for_records(1)
+
+        os.rename(active_log, archived_log)
+        write_and_sync(
+            active_log,
+            "".join(f"new-before-restart-{index}\n" for index in range(25)),
+        )
+
+        records = first_run.wait_for_records(26, timeout=20)
+        expected = ["before-recreate"]
+        expected.extend(f"new-before-restart-{index}" for index in range(25))
+        assert_log_set(records, expected)
+    finally:
+        first_run.stop()
+
+    expected_after_restart = [
+        f"new-after-restart-{index}" for index in range(25)
+    ]
+    write_and_sync(
+        active_log,
+        "".join(f"{line}\n" for line in expected_after_restart),
+    )
+
+    second_run = Service("tail_inotify.yaml", tail_path=active_log, db_path=db_path)
+    try:
+        second_run.start()
+        records = second_run.wait_for_records(
+            len(expected_after_restart), timeout=20
+        )
+    finally:
+        second_run.stop()
+
+    assert_log_set(records, expected_after_restart)
 
 
 @skip_on_windows

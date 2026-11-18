@@ -11,6 +11,8 @@ harness, not just unit or runtime-library coverage.
 - discovery of new files from tail when `read_newly_discovered_files_from_head` is disabled
 - startup with `read_from_head: false`
 - rename rotation with writes to both old and new files
+- identity-based rotation when the archive keeps the same basename
+- descriptor switch logging with old and new device/inode identity
 - repeated rename rotation on the same path
 - copytruncate with a stale writer file descriptor
 - symlink target rotation
@@ -24,9 +26,11 @@ harness, not just unit or runtime-library coverage.
 - `rotate_wait` behavior before and after purge
 - delete and recreate of the same path
 - restart with DB offset reuse
+- restart after a same-name file recreation
 - copytruncate across restart
 - partial-line completion across restart
 - multi-file rapid rotation
+- rotation under write load without loss or duplicates
 - gzip static file ingestion
 - generic input encoding conversion
 - `exclude_path` filtering

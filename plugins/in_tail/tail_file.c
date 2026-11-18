@@ -298,6 +298,19 @@ static uint64_t stat_get_st_dev(struct stat *st)
 #endif
 }
 
+static inline int stat_identity_matches(struct stat *left, struct stat *right)
+{
+    return stat_get_st_dev(left) == stat_get_st_dev(right) &&
+           (uint64_t) left->st_ino == (uint64_t) right->st_ino;
+}
+
+static inline int file_identity_matches(struct flb_tail_file *file,
+                                        struct stat *st)
+{
+    return file->dev_id == stat_get_st_dev(st) &&
+           file->inode == (uint64_t) st->st_ino;
+}
+
 static int stat_to_hash_bits(struct flb_tail_config *ctx, struct stat *st,
                              uint64_t *out_hash)
 {
@@ -1416,12 +1429,14 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     uint64_t stream_id;
     uint64_t ts;
     uint64_t hash_bits;
+    uint64_t dev_id;
     flb_sds_t hash_key;
     size_t len;
     char *tag;
     char *name;
     size_t tag_len;
     struct flb_tail_file *file;
+    struct stat fst;
     struct stat lst;
     flb_sds_t inode_str;
 
@@ -1445,6 +1460,33 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
         flb_plg_error(ctx->ins, "cannot open %s", path);
         return -1;
     }
+
+    /*
+     * The path can be replaced between stat(2) and open(2). Always derive
+     * the tracked identity from the descriptor we actually opened, otherwise
+     * a same-name replacement can make this entry inherit the wrong offset
+     * and file identity.
+     */
+    ret = fstat(fd, &fst);
+    if (ret == -1) {
+        flb_errno();
+        flb_plg_error(ctx->ins, "cannot stat opened file %s", path);
+        goto err_close_fd;
+    }
+
+    if (!S_ISREG(fst.st_mode)) {
+        flb_plg_error(ctx->ins, "opened file is not regular: %s", path);
+        goto err_close_fd;
+    }
+
+    if (!stat_identity_matches(st, &fst)) {
+        flb_plg_debug(ctx->ins,
+                      "file changed while opening %s: stat_inode=%"PRIu64
+                      " open_inode=%"PRIu64,
+                      path, (uint64_t) st->st_ino, (uint64_t) fst.st_ino);
+    }
+
+    st = &fst;
 
     file = flb_calloc(1, sizeof(struct flb_tail_file));
     if (!file) {
@@ -1483,6 +1525,8 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     }
     file->hash_key = hash_key;
 
+    dev_id          = stat_get_st_dev(st);
+    file->dev_id    = dev_id;
     file->inode     = st->st_ino;
     file->offset    = 0;
     file->size      = st->st_size;
@@ -2204,8 +2248,9 @@ int flb_tail_file_is_rotated(struct flb_tail_config *ctx,
                              struct flb_tail_file *file)
 {
     int ret;
-    char *name;
-    struct stat st;
+    char *path;
+    struct stat fd_st;
+    struct stat path_st;
 
     /*
      * Do not double-check already rotated files since the caller of this
@@ -2215,61 +2260,48 @@ int flb_tail_file_is_rotated(struct flb_tail_config *ctx,
         return FLB_FALSE;
     }
 
-    /* Check if the 'original monitored file' is a link and rotated */
-    if (file->is_link == FLB_TRUE) {
-        ret = tail_file_lstat(ctx, file->name, &st);
-        if (ret == -1) {
-            /* Broken link or missing file */
-            if (errno == ENOENT) {
-                flb_plg_info(ctx->ins, "inode=%"PRIu64" link_rotated: %s",
-                             file->link_inode, file->name);
-                return FLB_TRUE;
-            }
-            else {
-                flb_errno();
-                flb_plg_error(ctx->ins,
-                              "link_inode=%"PRIu64" cannot detect if file: %s",
-                              file->link_inode, file->name);
-                return -1;
-            }
-        }
-        else {
-            /* The file name is there, check if the same that we have */
-            if (st.st_ino != file->link_inode) {
-                return FLB_TRUE;
-            }
-        }
-    }
-
-    /* Retrieve the real file name, operating system lookup */
-    name = flb_tail_file_name(file);
-    if (!name) {
+    ret = fstat(file->fd, &fd_st);
+    if (ret == -1) {
+        flb_errno();
         flb_plg_error(ctx->ins,
-                      "inode=%"PRIu64" cannot detect if file was rotated: %s",
+                      "inode=%"PRIu64" cannot stat open handle: %s",
                       file->inode, file->name);
         return -1;
     }
 
-
-    /* Get stats from the file name */
-    ret = tail_file_stat(ctx, name, &st);
+    /*
+     * A rotation is a change of the file at the monitored path, not a
+     * change of its name. Compare the identity of the open handle with the
+     * current path so a file archived elsewhere with the same basename is
+     * still recognized as replaced.
+     */
+    path = file->orig_name != NULL ? file->orig_name : file->name;
+    ret = tail_file_stat(ctx, path, &path_st);
     if (ret == -1) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            flb_plg_debug(ctx->ins,
+                          "inode=%"PRIu64" monitored path no longer exists: %s",
+                          file->inode, path);
+            return FLB_TRUE;
+        }
+
         flb_errno();
-        flb_free(name);
+        flb_plg_error(ctx->ins,
+                      "inode=%"PRIu64" cannot stat monitored path: %s",
+                      file->inode, path);
         return -1;
     }
 
-    /* Compare inodes and names */
-    if (file->inode == st.st_ino &&
-        flb_tail_target_file_name_cmp(name, file) == 0) {
-        flb_free(name);
+    if (stat_identity_matches(&fd_st, &path_st)) {
         return FLB_FALSE;
     }
 
-    flb_plg_debug(ctx->ins, "inode=%"PRIu64" rotated: %s => %s",
-                  file->inode, file->name, name);
+    flb_plg_debug(ctx->ins,
+                  "inode=%"PRIu64" dev=%"PRIu64" rotated: %s now has "
+                  "inode=%"PRIu64" dev=%"PRIu64,
+                  file->inode, file->dev_id, path,
+                  (uint64_t) path_st.st_ino, stat_get_st_dev(&path_st));
 
-    flb_free(name);
     return FLB_TRUE;
 }
 
@@ -2484,6 +2516,7 @@ int flb_tail_file_rotated(struct flb_tail_file *file)
     uint64_t ts;
     char *name;
     char *i_name;
+    char *lookup_name;
     char *tmp;
     struct stat st;
     struct flb_tail_config *ctx = file->config;
@@ -2499,7 +2532,36 @@ int flb_tail_file_rotated(struct flb_tail_file *file)
 
     /* Update local file entry */
     tmp = file->name;
-    flb_tail_file_name_dup(name, file);
+    lookup_name = flb_strdup(file->orig_name != NULL ? file->orig_name : tmp);
+    if (lookup_name == NULL) {
+        flb_errno();
+        flb_free(name);
+        return -1;
+    }
+
+    file->name = flb_strdup(name);
+    if (file->name == NULL) {
+        flb_errno();
+        file->name = tmp;
+        flb_free(lookup_name);
+        flb_free(name);
+        return -1;
+    }
+    file->name_len = strlen(file->name);
+
+    if (file->real_name != NULL) {
+        flb_free(file->real_name);
+    }
+    file->real_name = flb_strdup(name);
+    if (file->real_name == NULL) {
+        flb_errno();
+        flb_free(file->name);
+        file->name = tmp;
+        flb_free(lookup_name);
+        flb_free(name);
+        return -1;
+    }
+
     flb_plg_info(ctx->ins, "inode=%"PRIu64" handle rotation(): %s => %s",
                  file->inode, tmp, file->name);
     if (file->rotated == 0) {
@@ -2528,10 +2590,18 @@ int flb_tail_file_rotated(struct flb_tail_file *file)
 #endif
 
         /* Check if a new file has been created */
-        ret = tail_file_stat(ctx, tmp, &st);
-        if (ret == 0 && st.st_ino != file->inode) {
+        ret = tail_file_stat(ctx, lookup_name, &st);
+        if (ret == 0 && !file_identity_matches(file, &st)) {
+            flb_plg_info(ctx->ins,
+                         "file switch: path=%s old_handle=%s "
+                         "old_dev=%"PRIu64" old_inode=%"PRIu64" "
+                         "new_dev=%"PRIu64" new_inode=%"PRIu64,
+                         lookup_name, name, file->dev_id, file->inode,
+                         stat_get_st_dev(&st), (uint64_t) st.st_ino);
+
             if (flb_tail_file_exists(&st, ctx) == FLB_FALSE) {
-                ret = flb_tail_file_append(tmp, &st, FLB_TAIL_STATIC, -1, ctx);
+                ret = flb_tail_file_append(lookup_name, &st,
+                                           FLB_TAIL_STATIC, -1, ctx);
                 if (ret == -1) {
                     flb_tail_scan(ctx->path_list, ctx);
                 }
@@ -2540,8 +2610,16 @@ int flb_tail_file_rotated(struct flb_tail_file *file)
                 }
             }
         }
+        else {
+            flb_plg_info(ctx->ins,
+                         "file switch: path=%s old_handle=%s "
+                         "old_dev=%"PRIu64" old_inode=%"PRIu64" "
+                         "new_file=pending",
+                         lookup_name, name, file->dev_id, file->inode);
+        }
     }
     flb_free(tmp);
+    flb_free(lookup_name);
     flb_free(name);
 
     return 0;
